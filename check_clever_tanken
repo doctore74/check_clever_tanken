@@ -1,10 +1,48 @@
 #!/usr/bin/perl
+
+# Date:
+#  2017-12-21
+#
+# Author:
+#  Christian Wirtz, doc@snowheaven.de
+#
+# Description:
+#   Parse clever-tanken.de to extract provided fuel types.
+#   This version adds some functionality
+#
+# Source/Forked from:
+#   https://blog.veloc1ty.de/2017/04/18/benzinpreis-monitoring-mit-icinga-2/
+#
+# Usage:
+#   default Icinga2:     ./check_clever_tanken_args --station 47684
+#   Check_MK/Nagios/...: ./check_clever_tanken_args --station 47684 --favorite Super --outputtype singleline --perfdatastyle short
+#
+# Changelog:
+#   2017-12-21 CW Added some inline documentation
+#   2017-12-21 CW added optional debug output            => arg: --debug
+#   2017-12-21 CW optimize output for Check_MK           => arg: --outputtype
+#   2017-12-21 CW optimize perfdata for Check_MK         => arg: --perfdatastyle
+#   2017-12-21 CW added optional hyperlink to gasstation => arg: --hlink
+#   2017-12-21 CW Added functionality to set a favorite  => arg: --favorite
+#                 Filter displaystring for favorite (display everything what beginns with provided arg string --favorite)
+#                 f.e. "Diesel", "Super" or "S"
+
+# ToDo.
+#   2017-12-21 CW Euro character isn'n working UTF8?
+
 use strict;
 use LWP::UserAgent;
 use Getopt::Long;
+use utf8;
 
-my $stationID = 0;
-my $alarm = {};
+my $stationID     = 0;
+my $alarm         = {};
+my $debug;              # (default: unset)
+my $favorite      = ""; # Regex: ...beginns with given string (default: unset)
+my $outputtype    = ""; # singleline or multiline (default: multiline)
+my $perfdatastyle = ""; # short or long (default: long)
+my $hlink;              # (default: unset)
+my $hyperlink     = ""; # for output of hyperlink to http://www.clever-tanken.de/tankstelle_details/{stationID}
 
 sub exitCritical {
     printf("CRITICAL - %s\n", shift);
@@ -29,8 +67,13 @@ sub parseArguments {
     my @alarmings = ();
 
     GetOptions(
-        'station=i' => \$stationID,
-        'alarm=s' => \@alarmings
+        'debug'           => \$debug,
+        'station=i'       => \$stationID,
+        'alarm=s'         => \@alarmings,
+        'favorite=s'      => \$favorite,
+        'outputtype=s'    => \$outputtype,
+        'perfdatastyle=s' => \$perfdatastyle,
+        'hlink'           => \$hlink,
     );
 
     if ( $stationID !~ /^\d+$/ ) {
@@ -46,6 +89,24 @@ sub parseArguments {
             $alarm->{$1} = $2;
         }
     }
+
+    if ( $outputtype eq '' ) {
+        $outputtype = "multiline";
+    }
+
+    if ( $perfdatastyle eq '' ) {
+        $perfdatastyle = "long";
+    }
+
+    if ( $hlink ) {
+        $hlink = "http://www.clever-tanken.de/tankstelle_details/";
+    }
+
+    print "stationID    : ".$stationID."\n" if ($debug);
+    print "favorite     : ".$favorite."\n" if ($debug);
+    print "outputtype   : ".$outputtype."\n" if ($debug);
+    print "perfdatastyle: ".$perfdatastyle."\n" if ($debug);
+    print "hlink        : ".$hlink."\n" if ($debug);
 }
 
 sub extractFuelType {
@@ -120,18 +181,42 @@ sub produceUserAgent {
 sub generateDisplayAndPerformanceString {
     my ( $stationName, $stationStreet, $prices ) = @_;
 
-    my $displayString = sprintf("%s %s:\n\n", $stationName, $stationStreet);
+    # Multiline output
+    # => Freie Tankstelle Ahnfeldstr. 12: <br>Autogas: 0.57 ...<br>Diesel: ...
+    #my $displayString = sprintf("%s %s:\n\n", $stationName, $stationStreet);
+
+    # Singleline output
+    # => Autogas: 0.57 ...<br>Diesel: ...
+    my $displayString = "";
+
     my $performanceString = '';
     my $performacePrefix =
         convertToNagiosVariable($stationName . ' ' . $stationStreet);
     my $returnCode = 0;
 
     foreach my $currentFuel ( sort keys %{$prices} ) {
-        # Generate a performance string part
-        $performanceString .= sprintf('%s_%s=%.2f ',
-            $performacePrefix,
-            convertToNagiosVariable($currentFuel),
-            $prices->{$currentFuel});
+        # Generate a performancestring part
+
+        # => Freie_Tankstelle_Ahnfeldstr_12_Autogas=0.57
+        if ($perfdatastyle eq "long") {
+          $performanceString .= sprintf('%s_%s=%.2f ',
+          $performacePrefix,
+          convertToNagiosVariable($currentFuel),
+          $prices->{$currentFuel});
+        }
+
+        # => Autogas_Freie_Tankstelle_Ahnfeldstr_12=0.57
+        #$performanceString .= sprintf('%s_%s=%.2f ',
+        #    convertToNagiosVariable($currentFuel),
+        #    $performacePrefix,
+        #    $prices->{$currentFuel});
+
+        # => Autogas=0.57
+        if ($perfdatastyle eq "short") {
+          $performanceString .= sprintf('%s=%.2f ',
+              convertToNagiosVariable($currentFuel),
+              $prices->{$currentFuel});
+        }
 
         # Generate a display string part
         if ( exists($alarm->{$currentFuel}) ) {
@@ -159,11 +244,31 @@ sub generateDisplayAndPerformanceString {
             }
         }
 
-        $displayString .= sprintf("%s: %.2f €/l\n",
-            $currentFuel, $prices->{$currentFuel});
-    }
+        # Displaystring (EURO char doesn't work at Check_MK? -> â¬/l  !!!!!)
+        #$displayString .= sprintf("%s: %.2f €/l\n",
 
-    printf("%s|%s\n", $displayString, $performanceString);
+        # Filter displaystring for favorite (display everything what beginns with provided arg for --favorite)
+        if ($favorite eq "") {
+          #if ($outputtype eq "singleline") { $displayString .= sprintf("%s: %.2f €/l ", $currentFuel, $prices->{$currentFuel}); }
+          if ($outputtype eq "singleline") { $displayString .= sprintf("%s: %.2f E/l ", $currentFuel, $prices->{$currentFuel}); }
+          #if ($outputtype eq "multiline")  { $displayString .= sprintf("%s: %.2f €/l\n", $currentFuel, $prices->{$currentFuel}); }
+          if ($outputtype eq "multiline")  { $displayString .= sprintf("%s: %.2f E/l\n", $currentFuel, $prices->{$currentFuel}); }
+        }
+	else {
+          #if ($outputtype eq "singleline") { $displayString .= sprintf("%s: %.2f €/l ", $currentFuel, $prices->{$currentFuel}) if ($currentFuel =~ m/^$favorite/); }
+          if ($outputtype eq "singleline") { $displayString .= sprintf("%s: %.2f E/l ", $currentFuel, $prices->{$currentFuel}) if ($currentFuel =~ m/^$favorite/); }
+          #if ($outputtype eq "multiline")  { $displayString .= sprintf("%s: %.2f €/l\n", $currentFuel, $prices->{$currentFuel}) if ($currentFuel =~ m/^$favorite/); }
+          if ($outputtype eq "multiline")  { $displayString .= sprintf("%s: %.2f E/l\n", $currentFuel, $prices->{$currentFuel}) if ($currentFuel =~ m/^$favorite/); }
+        }
+}
+
+    # Generate output with hyperlink
+    $hyperlink = "<a href='".$hlink.$stationID."' target='_blank'>".$displayString." ".$hyperlink."</a>";
+
+    # Output
+    printf("%s|%s\n", $displayString, $performanceString) if (!$hlink);
+    print $hyperlink."|".$performanceString."\n" if ($hlink);
+
     exit($returnCode);
 }
 
